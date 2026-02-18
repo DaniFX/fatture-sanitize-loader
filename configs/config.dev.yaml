@@ -4,10 +4,6 @@ source_db:
 api_dest:
   base_url: "http://indirizzo"
 
-drop_folders:
-  attive:  "/path/drop/attive"
-  passive: "/path/drop/passive"
-
 batch:
   size: 100
 
