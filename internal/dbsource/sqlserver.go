@@ -43,6 +43,7 @@ func (s *SQLServerSource) Close() error {
 }
 
 // NextBatchAttive legge il prossimo batch di fatture attive da elaborare
+// Le fatture attive sono nella tabella PA_Storico con TipoFlusso = 'ATTIVO'
 func (s *SQLServerSource) NextBatchAttive(ctx context.Context, limit int) ([]document.Document, error) {
 	const q = `
         SELECT TOP (@p1) 
@@ -146,22 +147,23 @@ func (s *SQLServerSource) NextBatchAttive(ctx context.Context, limit int) ([]doc
 }
 
 // NextBatchPassive legge il prossimo batch di fatture passive da elaborare
+// Le fatture passive sono nella tabella B2B_Storico_RCV
+// NOTA: I file XML/P7M sono salvati su filesystem, non come BLOB nel database
 func (s *SQLServerSource) NextBatchPassive(ctx context.Context, limit int) ([]document.Document, error) {
 	const q = `
         SELECT TOP (@p1) 
-            Chiave, 
-            NrDoc, 
-            DataDoc, 
-            PivaCommittente,
-            Committente,
-            FileXML, 
-            FileXMLFirmato, 
-            NomeFileXML,
-            NomeFileXMLFirmato
-        FROM   PA_Storico
-        WHERE  (GlobeRestApiExported = 0 OR GlobeRestApiExported IS NULL)
-        AND    TipoFlusso = 'PASSIVO'
-        ORDER BY Chiave
+            Id, 
+            NumeroDocumento, 
+            DataDocumento, 
+            PIVAFornitore,
+            CodicefiscaleFornitore,
+            Fornitore,
+            NomeFile,
+            NomeFileArchivio,
+            TipoFirma
+        FROM   B2B_Storico_RCV
+        WHERE  GlobeRestApiExported = 0
+        ORDER BY Id
     `
 
 	rows, err := s.db.QueryContext(ctx, q, limit)
@@ -173,69 +175,71 @@ func (s *SQLServerSource) NextBatchPassive(ctx context.Context, limit int) ([]do
 	var docs []document.Document
 	for rows.Next() {
 		var (
-			chiave              int64
-			nrDoc               sql.NullString
-			dataDoc             sql.NullTime
-			pivaCommittente     sql.NullString
-			committente         sql.NullString
-			fileXML             []byte
-			fileXMLFirmato      []byte
-			nomeFileXML         sql.NullString
-			nomeFileXMLFirmato  sql.NullString
+			id                      int64
+			numeroDocumento         sql.NullString
+			dataDocumento           sql.NullTime
+			pivaFornitore           sql.NullString
+			codicefiscaleFornitore  sql.NullString
+			fornitore               sql.NullString
+			nomeFile                sql.NullString
+			nomeFileArchivio        sql.NullString
+			tipoFirma               sql.NullString
 		)
 
 		err := rows.Scan(
-			&chiave,
-			&nrDoc,
-			&dataDoc,
-			&pivaCommittente,
-			&committente,
-			&fileXML,
-			&fileXMLFirmato,
-			&nomeFileXML,
-			&nomeFileXMLFirmato,
+			&id,
+			&numeroDocumento,
+			&dataDocumento,
+			&pivaFornitore,
+			&codicefiscaleFornitore,
+			&fornitore,
+			&nomeFile,
+			&nomeFileArchivio,
+			&tipoFirma,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 
-		// Determina quale file utilizzare (P7M ha priorità)
-		var xmlData []byte
-		var isP7M bool
+		// Per le passive, i file sono su filesystem
+		// NomeFileArchivio contiene il path del file
 		var fileName string
+		if nomeFileArchivio.Valid && nomeFileArchivio.String != "" {
+			fileName = nomeFileArchivio.String
+		} else if nomeFile.Valid {
+			fileName = nomeFile.String
+		}
 
-		if len(fileXMLFirmato) > 0 {
-			xmlData = fileXMLFirmato
+		// Determina se è un file P7M
+		isP7M := false
+		if tipoFirma.Valid && tipoFirma.String == "P7M" {
 			isP7M = true
-			if nomeFileXMLFirmato.Valid {
-				fileName = nomeFileXMLFirmato.String
-			}
-		} else {
-			xmlData = fileXML
-			isP7M = false
-			if nomeFileXML.Valid {
-				fileName = nomeFileXML.String
-			}
 		}
 
 		// Formatta la data
 		var dataStr string
-		if dataDoc.Valid {
-			dataStr = dataDoc.Time.Format("2006-01-02")
+		if dataDocumento.Valid {
+			dataStr = dataDocumento.Time.Format("2006-01-02")
+		}
+
+		// Per le passive, usa PIVA se disponibile, altrimenti CF
+		cedenteCFPI := pivaFornitore.String
+		if cedenteCFPI == "" {
+			cedenteCFPI = codicefiscaleFornitore.String
 		}
 
 		doc := document.Document{
 			Tipo: document.TipoPassiva,
 			Meta: document.Meta{
-				SourceID:      fmt.Sprintf("%d", chiave),
-				Numero:        nrDoc.String,
+				SourceID:      fmt.Sprintf("%d", id),
+				Numero:        numeroDocumento.String,
 				Data:          dataStr,
-				CedenteCFPI:   pivaCommittente.String, // Per le passive, il cedente è il fornitore
+				CedenteCFPI:   cedenteCFPI,            // Per le passive, il cedente è il fornitore
 				CessionarioCF: "",                     // Il cessionario siamo noi (da configurazione)
 				FileNameOrig:  fileName,
 				IsP7M:         isP7M,
 			},
-			XML: xmlData,
+			XML: nil, // Per le passive, XML deve essere letto da filesystem
 		}
 
 		docs = append(docs, doc)
@@ -248,8 +252,8 @@ func (s *SQLServerSource) NextBatchPassive(ctx context.Context, limit int) ([]do
 	return docs, nil
 }
 
-// MarkAsProcessed segna un documento come elaborato nel database
-func (s *SQLServerSource) MarkAsProcessed(ctx context.Context, sourceID string) error {
+// MarkAsProcessedAttive segna una fattura attiva come elaborata
+func (s *SQLServerSource) MarkAsProcessedAttive(ctx context.Context, sourceID string) error {
 	const q = `
         UPDATE PA_Storico 
         SET GlobeRestApiExported = 1, 
@@ -259,7 +263,24 @@ func (s *SQLServerSource) MarkAsProcessed(ctx context.Context, sourceID string) 
 
 	_, err := s.db.ExecContext(ctx, q, time.Now(), sourceID)
 	if err != nil {
-		return fmt.Errorf("mark as processed: %w", err)
+		return fmt.Errorf("mark attiva as processed: %w", err)
+	}
+
+	return nil
+}
+
+// MarkAsProcessedPassive segna una fattura passiva come elaborata
+func (s *SQLServerSource) MarkAsProcessedPassive(ctx context.Context, sourceID string) error {
+	const q = `
+        UPDATE B2B_Storico_RCV 
+        SET GlobeRestApiExported = 1, 
+            DataEstrazione = @p1
+        WHERE Id = @p2
+    `
+
+	_, err := s.db.ExecContext(ctx, q, time.Now(), sourceID)
+	if err != nil {
+		return fmt.Errorf("mark passiva as processed: %w", err)
 	}
 
 	return nil
