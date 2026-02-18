@@ -1,0 +1,16 @@
+source_db:
+  dsn: "sqlserver://user:pass@HOST:1433?database=Origine&encrypt=disable"
+
+api_dest:
+  base_url: "http://indirizzo"
+
+drop_folders:
+  attive:  "/path/drop/attive"
+  passive: "/path/drop/passive"
+
+batch:
+  size: 100
+
+sanitization:
+  attive_ruleset:  "default-attive"
+  passive_ruleset: "default-passive"
